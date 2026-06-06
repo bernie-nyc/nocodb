@@ -5989,6 +5989,14 @@ export class ColumnsService implements IColumnsService {
           return v;
         }),
       );
+      // The column itself carries the same circular relation graph; broadcast
+      // the already-safe clone from `safeTable.columns`, not the raw instance,
+      // or serializing the socket payload blows the stack (e.g. restoring a
+      // junction-less hm/bt pair on undo).
+      const safeColumn =
+        (safeTable.columns as Array<{ id?: string }> | undefined)?.find(
+          (c) => c.id === param.columnId,
+        ) ?? safeTable.columns?.[0];
 
       this.appHooksService.emit(AppEvents.COLUMN_UPDATE, {
         table: freshTable,
@@ -6005,7 +6013,7 @@ export class ColumnsService implements IColumnsService {
           event: EventType.META_EVENT,
           payload: {
             action: 'column_update',
-            payload: { table: safeTable, column },
+            payload: { table: safeTable, column: safeColumn },
           },
         },
         context.socket_id,
@@ -6483,20 +6491,48 @@ export class ColumnsService implements IColumnsService {
       }
       // bt / mo / oo — single linked record. V2 links (mo, V2 oo, and any
       // single-target link backed by a junction) resolve through `mmRead`.
-      // V1 `bt`/`oo` are junction-less: `mmRead` returns null for every row
-      // (no mm model to read through), which would silently empty the column
-      // before the forward path hard-deletes the link. Discriminate by
-      // junction presence and read junction-less links via `btRead` instead.
       const hasJunction = !!(
         groupCtx.colOptions as { fk_mm_model_id?: string }
       ).fk_mm_model_id;
-      const rec = hasJunction
-        ? await baseModel.mmRead(
-            { colId: column.id, parentId: pk },
-            { fieldsSet: dvSet },
-          )
-        : await baseModel.btRead({ colId: column.id, id: pk }, { fieldSet: dvSet });
-      return rec ? (Array.isArray(rec) ? rec : [rec]) : [];
+      if (hasJunction) {
+        const rec = await baseModel.mmRead(
+          { colId: column.id, parentId: pk },
+          { fieldsSet: dvSet },
+        );
+        return rec ? (Array.isArray(rec) ? rec : [rec]) : [];
+      }
+      // Junction-less V1 link. `mmRead` returns null here (no mm model), which
+      // would silently empty the column. The read depends on which side holds
+      // the FK:
+      //  - FK side (`bt`, or the bt-flagged `oo` reverse) → `btRead`.
+      //  - has-one side (`oo` primary, no FK on its own table) → `hmList`;
+      //    `btRead` would read the wrong row (it assumes the FK is local).
+      const colMeta =
+        typeof column.meta === 'string'
+          ? (() => {
+              try {
+                return JSON.parse(column.meta as unknown as string);
+              } catch {
+                return {};
+              }
+            })()
+          : (column.meta as Record<string, any> | undefined) ?? {};
+      const isFkSide =
+        relType === RelationTypes.BELONGS_TO ||
+        (relType === RelationTypes.ONE_TO_ONE && !!colMeta?.bt);
+      if (isFkSide) {
+        const rec = await baseModel.btRead(
+          { colId: column.id, id: pk },
+          { fieldSet: dvSet },
+        );
+        return rec ? (Array.isArray(rec) ? rec : [rec]) : [];
+      }
+      return (
+        (await baseModel.hmList(
+          { colId: column.id, id: pk },
+          { fieldSet: dvSet },
+        )) || []
+      );
     };
 
     // Read each row's linked records and join their display values.
