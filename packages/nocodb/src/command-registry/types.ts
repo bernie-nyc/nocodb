@@ -254,6 +254,9 @@ export interface CaptureBag {
   /** Set on a SingleLineText→link conversion: the created link column id +
    *  the replaced text column snapshot — needed to invert the conversion. */
   convertedLink: { linkColumnId: string; textColumn: Record<string, unknown> };
+  /** Set on a link→SingleLineText conversion: the created text column id, so
+   *  redo (and sandbox replay) recreates the text column with the same id. */
+  convertedText: { textColumnId: string };
   /** Every column created during a table-create (system + user + LTAR junction). */
   sandboxColumns: ReadonlyArray<{
     id?: string;

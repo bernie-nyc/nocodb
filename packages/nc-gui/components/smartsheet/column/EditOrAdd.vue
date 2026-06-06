@@ -496,15 +496,10 @@ async function onSubmit() {
   if (isEdit.value && formState.value.uidt !== column.value?.uidt) {
     warningVisible.value = true
 
-    // link → SingleLineText is not yet undoable; everything else (text → link,
-    // scalar type changes) is recorded as an undoable columnUpdate.
-    const isLtarToText = canConvertLtarToText.value && formState.value.uidt === UITypes.SingleLineText
-
     const { close } = useDialog(resolveComponent('DlgColumnUpdateConfirm'), {
       'visible': warningVisible,
       'onUpdate:visible': (value) => (warningVisible.value = value),
       'saving': saving,
-      'undoable': !isLtarToText,
       'onSubmit': async () => {
         close()
         await saveSubmitted()

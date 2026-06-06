@@ -6250,10 +6250,19 @@ export class ColumnsService implements IColumnsService {
 
     // 1. Drop the link column — cascades junction model, FK + back-link
     //    columns, and all link rows. Hard-delete so redo can recreate the link
-    //    (and its junction/back-links) with the same ids.
+    //    (and its junction/back-links) with the same ids. Skip the link
+    //    placeholder: the original was a plain text column with no relationship,
+    //    so a placeholder on the related table would be spurious (and gets a
+    //    fresh id on every replay).
     await this.columnDelete(
       context,
-      { columnId: linkColumnId, skipTrash: true, req, reuse: {} },
+      {
+        columnId: linkColumnId,
+        skipTrash: true,
+        skipLinkPlaceholder: true,
+        req,
+        reuse: {},
+      },
       this.metaService,
     );
 
@@ -6391,12 +6400,19 @@ export class ColumnsService implements IColumnsService {
     }
 
     // Create the text column with a temp title (avoid clash with the link col).
+    // Under replay (redo / sandbox merge) reuse the originally-created text
+    // column id so later ops referencing it stay valid; the handler deposits
+    // it into the replay scope before calling this service.
+    const replayTextColumnId = isReplay()
+      ? (getReplay('convertedTextId') as string | undefined)
+      : undefined;
     const tempTitle = `${originalTitle}_text_${enumRebuildSuffix()}`;
     await this.columnAdd(context, {
       tableId: table.id,
       column: {
         uidt: UITypes.SingleLineText,
         title: tempTitle,
+        ...(replayTextColumnId ? { id: replayTextColumnId } : {}),
       } as unknown as ColumnReqType,
       user,
       req,
@@ -6408,6 +6424,10 @@ export class ColumnsService implements IColumnsService {
     if (!textColumn) {
       NcError.get(context).badRequest('Failed to create text column');
     }
+
+    // Capture the new text column id so redo / sandbox replay recreates it
+    // with the same id (undo rebuilds the link from this column's joined text).
+    captureForTrace('convertedText', { textColumnId: textColumn.id });
 
     // Populate the text column with the joined display values (direct per-row
     // update — unambiguous about pk vs value, unlike the bulk CASE builder).
@@ -6422,10 +6442,19 @@ export class ColumnsService implements IColumnsService {
     }
 
     // Drop the link column (skipTrash so undo can recreate it with the same
-    // id), then rename the text column to the original title.
+    // id), then rename the text column to the original title. Skip the link
+    // placeholder — the conversion intentionally drops the relationship, and a
+    // placeholder text column left on the related table would get a fresh id on
+    // every replay (breaking id-preservation) and pollute the related table.
     await this.columnDelete(
       context,
-      { columnId: column.id, skipTrash: true, req, reuse: {} },
+      {
+        columnId: column.id,
+        skipTrash: true,
+        skipLinkPlaceholder: true,
+        req,
+        reuse: {},
+      },
       this.metaService,
     );
     await Column.update2(context, {
@@ -6439,6 +6468,80 @@ export class ColumnsService implements IColumnsService {
     );
 
     return textColumn.id;
+  }
+
+  /**
+   * Inverse of {@link convertLtarToSingleLineText}: drop the text column the
+   * forward conversion created, recreate the original link column (reusing its
+   * id), and re-link each row by resolving the joined display values back to
+   * related records. Delegates to {@link convertSingleLineTextToLtar}, which
+   * already drops the source text column, recreates the link (honoring the
+   * pre-set id under replay), and backfills the links. Runs under the
+   * undo/redo replay scope.
+   */
+  async revertTextColumnToLink(
+    context: NcContext,
+    param: {
+      textColumnId: string;
+      link: {
+        id: string;
+        fk_model_id: string;
+        title?: string;
+        uidt?: string;
+        type?: string;
+        parentId?: string;
+        childId?: string;
+        ref_base_id?: string | null;
+        fk_target_view_id?: string | null;
+        fk_display_value_column_id?: string | null;
+        meta?: Record<string, any> | string | null;
+      };
+      req: NcRequest;
+    },
+  ) {
+    const { textColumnId, link, req } = param;
+
+    const textColumn = await Column.get(context, { colId: textColumnId });
+    if (!textColumn) {
+      NcError.get(context).genericNotFound('Column', textColumnId);
+    }
+
+    const table = await Model.get(context, textColumn.fk_model_id);
+    if (!table) {
+      NcError.get(context).tableNotFound(textColumn.fk_model_id);
+    }
+    const source = await Source.get(context, table.source_id);
+
+    // Reuse the original link column id when recreating it (honored by
+    // `convertSingleLineTextToLtar` via `getReplay('convertedLinkId')`).
+    if (link.id) setReplay('convertedLinkId', link.id);
+
+    const colBody = {
+      uidt: link.uidt ?? UITypes.LinkToAnotherRecord,
+      title: link.title ?? textColumn.title,
+      parentId: link.parentId ?? link.fk_model_id,
+      childId: link.childId,
+      type: link.type,
+      ...(link.ref_base_id ? { ref_base_id: link.ref_base_id } : {}),
+      ...(link.fk_target_view_id
+        ? { fk_target_view_id: link.fk_target_view_id }
+        : {}),
+      ...(link.fk_display_value_column_id
+        ? { fk_display_value_column_id: link.fk_display_value_column_id }
+        : {}),
+      ...(link.meta ? { meta: link.meta } : {}),
+    };
+
+    await this.convertSingleLineTextToLtar(context, {
+      column: textColumn,
+      colBody: colBody as unknown as Column & { meta?: Record<string, any> },
+      table,
+      source,
+      user: req.user as UserType,
+      req,
+    });
+
+    return Column.get(context, { colId: link.id });
   }
 
   async createLTARColumn(

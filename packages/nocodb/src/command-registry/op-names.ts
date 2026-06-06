@@ -26,6 +26,9 @@ export const OperationName = {
   /** Inverse of a SingleLineText→link conversion: drop the link, recreate
    *  the text column (original id) and restore its backed-up data. */
   columnRevertLinkToText: 'columnRevertLinkToText',
+  /** Inverse of a link→SingleLineText conversion: drop the text column,
+   *  recreate the link (original id) and re-link rows from the joined text. */
+  columnRevertTextToLink: 'columnRevertTextToLink',
 
   // Views (generic)
   viewUpdate: 'viewUpdate',
