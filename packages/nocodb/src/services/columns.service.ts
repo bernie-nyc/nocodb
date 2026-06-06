@@ -1638,6 +1638,65 @@ export class ColumnsService implements IColumnsService {
             reuse: param.reuse,
           },
         );
+      } else if (
+        isLinksOrLTAR(column) &&
+        colBody.uidt === UITypes.SingleLineText
+      ) {
+        // Link (LTAR) → SingleLineText: join each row's linked display values
+        // into a new text column, drop the link. Replaces the column outright,
+        // so return early instead of falling through to the in-place tail.
+        const textColumnId = await this.convertLtarToSingleLineText(context, {
+          column,
+          colBody,
+          table,
+          source,
+          user: param.user,
+          req,
+        });
+
+        const freshTable = await Model.get(context, table.id);
+        await freshTable.getColumns(context);
+        const textColumn = await Column.get(context, { colId: textColumnId });
+
+        const seen = new WeakSet();
+        const safeTable = JSON.parse(
+          JSON.stringify(freshTable, (_k, v) => {
+            if (v && typeof v === 'object') {
+              if (seen.has(v)) return undefined;
+              seen.add(v);
+            }
+            return v;
+          }),
+        );
+
+        try {
+          this.appHooksService.emit(AppEvents.COLUMN_UPDATE, {
+            table: freshTable,
+            oldColumn: column,
+            column: textColumn,
+            columnId: textColumnId,
+            req: param.req,
+            context,
+            columns: safeTable.columns,
+          });
+          NocoSocket.broadcastEvent(
+            context,
+            {
+              event: EventType.META_EVENT,
+              payload: {
+                action: 'column_update',
+                payload: { table: safeTable, column: textColumn },
+              },
+            },
+            context.socket_id,
+          );
+        } catch (e) {
+          this.logger.warn(
+            `link→text post-update notification failed: ${e.message}`,
+          );
+        }
+
+        return safeTable;
       } else {
         NcError.get(context).notImplemented(
           `Updating ${column.uidt} => ${colBody.uidt}`,
@@ -6239,6 +6298,147 @@ export class ColumnsService implements IColumnsService {
     }
 
     return Column.get(context, { colId: textColumn.id });
+  }
+
+  /**
+   * Convert a link (LTAR) column into a SingleLineText column: each row's
+   * linked records' display values are joined (delimiter, default ',') into
+   * the new text column, then the link column is dropped and the text column
+   * takes its title. The inverse (undo) recreates the link and re-links by
+   * resolving those display values — see {@link convertSingleLineTextToLtar}.
+   */
+  async convertLtarToSingleLineText(
+    context: NcContext,
+    param: {
+      column: Column;
+      colBody: Column & { meta?: Record<string, any> };
+      table: Model;
+      source: Source;
+      user: UserType;
+      req: NcRequest;
+    },
+  ) {
+    const { column, colBody, table, source, user, req } = param;
+    const originalTitle = column.title;
+    const delimiter = (colBody.meta?.delimiter as string) || ',';
+
+    const dbDriver = await NcConnectionMgrv2.get(source);
+    const baseModel = await Model.getBaseModelSQL(context, {
+      id: table.id,
+      dbDriver,
+    });
+
+    // Display-value column of the related records (custom override or PV).
+    const groupCtx = await getLtarDisplayValueContext(context, column);
+    const dvTitle = groupCtx.displayValueColumn.title;
+    const relType = groupCtx.colOptions.type as RelationTypes;
+
+    await table.getColumns(context);
+    const pkTitle = table.primaryKeys[0]?.title;
+
+    const readLinked = async (pk: string | number): Promise<any[]> => {
+      const dvSet = new Set([dvTitle]);
+      if (relType === RelationTypes.MANY_TO_MANY) {
+        return (
+          (await baseModel.mmList(
+            { colId: column.id, parentId: pk },
+            { fieldsSet: dvSet },
+            true,
+          )) || []
+        );
+      }
+      if (
+        relType === RelationTypes.HAS_MANY ||
+        relType === RelationTypes.ONE_TO_MANY
+      ) {
+        return (
+          (await baseModel.hmList(
+            { colId: column.id, id: pk },
+            { fieldSet: dvSet },
+          )) || []
+        );
+      }
+      // bt / mo / oo — single linked record.
+      const rec = await baseModel.mmRead(
+        { colId: column.id, parentId: pk },
+        { fieldsSet: dvSet },
+      );
+      return rec ? (Array.isArray(rec) ? rec : [rec]) : [];
+    };
+
+    // Read each row's linked records and join their display values.
+    const rows: { pk: string | number; text: string }[] = [];
+    const PAGE = 500;
+    let offset = 0;
+    for (;;) {
+      const page = await baseModel.list(
+        { fieldsSet: new Set([pkTitle].filter(Boolean) as string[]), limit: PAGE, offset },
+        { ignoreViewFilterAndSort: true },
+      );
+      if (!page.length) break;
+      for (const row of page) {
+        const pk = baseModel.extractPksValues(row, true);
+        const linked = await readLinked(pk);
+        if (!linked.length) continue;
+        const text = linked
+          .map((r) => (r == null ? null : r[dvTitle]))
+          .filter((v) => v !== null && v !== undefined && String(v).length > 0)
+          .join(delimiter);
+        if (text.length) rows.push({ pk, text });
+      }
+      if (page.length < PAGE) break;
+      offset += PAGE;
+    }
+
+    // Create the text column with a temp title (avoid clash with the link col).
+    const tempTitle = `${originalTitle}_text_${enumRebuildSuffix()}`;
+    await this.columnAdd(context, {
+      tableId: table.id,
+      column: {
+        uidt: UITypes.SingleLineText,
+        title: tempTitle,
+      } as unknown as ColumnReqType,
+      user,
+      req,
+      reuse: {},
+    });
+    const textColumn = (
+      await Column.list(context, { fk_model_id: table.id })
+    ).find((c) => c.title === tempTitle);
+    if (!textColumn) {
+      NcError.get(context).badRequest('Failed to create text column');
+    }
+
+    // Populate the text column with the joined display values (direct per-row
+    // update — unambiguous about pk vs value, unlike the bulk CASE builder).
+    const pkCn = table.primaryKeys[0]?.column_name;
+    if (rows.length && pkCn) {
+      const tnPath = baseModel.getTnPath(table.table_name);
+      for (const r of rows) {
+        await baseModel.dbDriver(tnPath)
+          .update({ [textColumn.column_name]: r.text })
+          .where(pkCn, r.pk);
+      }
+    }
+
+    // Drop the link column (skipTrash so undo can recreate it with the same
+    // id), then rename the text column to the original title.
+    await this.columnDelete(
+      context,
+      { columnId: column.id, skipTrash: true, req, reuse: {} },
+      this.metaService,
+    );
+    await Column.update2(context, {
+      colId: textColumn.id,
+      column: { title: originalTitle },
+      isSimpleUpdate: true,
+    });
+
+    this.logger.log(
+      `Converted link "${originalTitle}" to text: ${rows.length} rows populated.`,
+    );
+
+    return textColumn.id;
   }
 
   async createLTARColumn(

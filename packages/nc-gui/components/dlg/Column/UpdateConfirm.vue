@@ -1,8 +1,13 @@
 <script setup lang="ts">
-const props = defineProps<{
-  visible?: boolean
-  saving?: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    visible?: boolean
+    saving?: boolean
+    /** Whether the change can be reverted via undo (false e.g. for link→text). */
+    undoable?: boolean
+  }>(),
+  { undoable: true },
+)
 
 const emit = defineEmits(['submit', 'cancel', 'update:visible'])
 
@@ -24,8 +29,13 @@ const visible = useVModel(props, 'visible', emit)
       >
         <div class="flex item-center gap-2">
           <GeneralIcon id="nc-selected-item-icon" icon="alertTriangle" class="h-10 w-10 text-nc-content-yellow-medium" />
-          This action cannot be undone. Converting data types may result in data loss; any incompatible filters will be removed.
-          Proceed with caution!
+          <template v-if="props.undoable">
+            Converting data types may result in data loss; any incompatible filters will be removed. You can undo this change.
+          </template>
+          <template v-else>
+            This action cannot be undone. Converting data types may result in data loss; any incompatible filters will be removed.
+            Proceed with caution!
+          </template>
         </div>
       </div>
 

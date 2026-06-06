@@ -243,6 +243,11 @@ const uiFilters = (t: UiTypesType) => {
   if (t.name === column?.value?.uidt) {
     return true
   }
+  // A link (LTAR/Links) column can only be converted to SingleLineText (its
+  // linked display values are joined into text) — hide all other targets.
+  if (isEdit.value && column?.value && isLinksOrLTAR(column.value)) {
+    return t.name === UITypes.SingleLineText
+  }
   // M2M junction tables have no source rows for system audit fields — values would always be null
   const isMmTable = !!meta.value?.mm
   if (isMmTable && isSystemField(t)) return false
@@ -303,6 +308,10 @@ const uiFilters = (t: UiTypesType) => {
 const isTextToLtarConversion = computed(
   () => isEdit.value && column?.value?.uidt === UITypes.SingleLineText && formState.value.uidt === UITypes.LinkToAnotherRecord,
 )
+
+// Editing a link (LTAR/Links) column — the type dropdown is normally locked
+// for links, but we allow converting them to SingleLineText.
+const canConvertLtarToText = computed(() => isEdit.value && !!column?.value && isLinksOrLTAR(column.value))
 
 const extraIcons = ref<Record<string, string>>({})
 
@@ -487,10 +496,15 @@ async function onSubmit() {
   if (isEdit.value && formState.value.uidt !== column.value?.uidt) {
     warningVisible.value = true
 
+    // link → SingleLineText is not yet undoable; everything else (text → link,
+    // scalar type changes) is recorded as an undoable columnUpdate.
+    const isLtarToText = canConvertLtarToText.value && formState.value.uidt === UITypes.SingleLineText
+
     const { close } = useDialog(resolveComponent('DlgColumnUpdateConfirm'), {
       'visible': warningVisible,
       'onUpdate:visible': (value) => (warningVisible.value = value),
       'saving': saving,
+      'undoable': !isLtarToText,
       'onSubmit': async () => {
         close()
         await saveSubmitted()
@@ -1281,7 +1295,7 @@ const unique = computed({
                 (isEdit && isMetaReadOnly && !readonlyMetaAllowedTypes.includes(formState.uidt)) ||
                 isKanban ||
                 readOnly ||
-                (isEdit && !!onlyNameUpdateOnEditColumns.includes(column?.uidt)) ||
+                (isEdit && !!onlyNameUpdateOnEditColumns.includes(column?.uidt) && !canConvertLtarToText) ||
                 (isEdit && !isFullUpdateAllowed) ||
                 isSystem ||
                 isSyncedField
