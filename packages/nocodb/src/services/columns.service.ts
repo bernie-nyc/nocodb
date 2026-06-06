@@ -142,6 +142,12 @@ import { DBErrorExtractor } from '~/helpers/db-error/extractor';
 import { MetaDependencyEventHandler } from '~/services/meta-dependency/event-handler.service';
 import { getRelatedModelMap } from '~/utils/getRelatedModelMap';
 import { processConcurrently } from '~/utils/dataUtils';
+
+// Hard cap on table size for a synchronous (in-request) text↔link conversion.
+// Above this the per-row link read/write would risk a request timeout; reject
+// with a clear error rather than start an op that can't finish. (A background-
+// job path can lift this later)
+const LTAR_CONVERSION_MAX_ROWS = 10_000;
 import { validateColumnInternalMeta } from '~/types/column-internal-meta';
 import { backfillAutoNumber } from '~/helpers/autonumberHelpers';
 
@@ -6029,6 +6035,29 @@ export class ColumnsService implements IColumnsService {
   }
 
   /**
+   * Guard a synchronous text↔link conversion against oversized tables. The
+   * conversion does per-row link reads/writes in the request thread; above
+   * {@link LTAR_CONVERSION_MAX_ROWS} that risks a request timeout, so reject up
+   * front with a clear message. Skipped under replay (undo/redo/sandbox merge):
+   * those must always complete, and the forward already enforced the cap so the
+   * table can't have grown past it through the conversion.
+   */
+  protected async assertConvertibleRowCount(
+    context: NcContext,
+    baseModel: Awaited<ReturnType<typeof Model.getBaseModelSQL>>,
+  ): Promise<void> {
+    if (isReplay()) return;
+    const rowCount = Number(await baseModel.count({}, true));
+    if (Number.isFinite(rowCount) && rowCount > LTAR_CONVERSION_MAX_ROWS) {
+      NcError.get(context).badRequest(
+        `Cannot convert: this table has ${rowCount.toLocaleString()} records, ` +
+          `which exceeds the ${LTAR_CONVERSION_MAX_ROWS.toLocaleString()}-record ` +
+          `limit for converting between text and link fields.`,
+      );
+    }
+  }
+
+  /**
    * Convert a SingleLineText column into a link (LTAR) field.
    *
    * Flow: snapshot the existing text per row → create the LTAR column (with a
@@ -6089,6 +6118,11 @@ export class ColumnsService implements IColumnsService {
       id: table.id,
       dbDriver,
     });
+
+    // Cap the synchronous conversion at a manageable table size — only on the
+    // real forward request (undo/redo/sandbox replay must always finish, and
+    // the forward already enforced the cap, so the table can't be larger).
+    await this.assertConvertibleRowCount(context, baseModel);
 
     await table.getColumns(context);
     const pkTitles = table.primaryKeys.map((pk) => pk.title);
@@ -6314,39 +6348,42 @@ export class ColumnsService implements IColumnsService {
     // Mirrors the data-import link phase. The counters are mutated only in
     // synchronous (post-await) statements, so single-threaded JS keeps them
     // race-free; each `pk` is distinct so concurrent writes never collide.
-    await processConcurrently(perRow, async ({ pk, values }) => {
-      const seen = new Set<string>();
-      const childIds: (string | number)[] = [];
-      for (const v of values) {
-        const matched = valueToPk.get(v);
-        if (matched === undefined || matched === null) {
-          valuesUnmatched += 1;
-          continue;
+    await processConcurrently(
+      perRow,
+      async ({ pk, values }) => {
+        const seen = new Set<string>();
+        const childIds: (string | number)[] = [];
+        for (const v of values) {
+          const matched = valueToPk.get(v);
+          if (matched === undefined || matched === null) {
+            valuesUnmatched += 1;
+            continue;
+          }
+          const key = String(matched);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          childIds.push(matched);
         }
-        const key = String(matched);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        childIds.push(matched);
-      }
-      if (!childIds.length) return;
+        if (!childIds.length) return;
 
-      const finalChildIds = groupCtx.isSingleLink ? [childIds[0]] : childIds;
-      try {
-        await baseModel.addLinks({
-          cookie: req,
-          colId: ltarColumn.id,
-          rowId: String(pk),
-          childIds: finalChildIds,
-        });
-        linksCreated += finalChildIds.length;
-      } catch (e) {
-        this.logger.warn(
-          `Failed to link row ${pk} during text→link conversion: ${
-            (e as Error).message
-          }`,
-        );
-      }
-    });
+        const finalChildIds = groupCtx.isSingleLink ? [childIds[0]] : childIds;
+        try {
+          await baseModel.addLinks({
+            cookie: req,
+            colId: ltarColumn.id,
+            rowId: String(pk),
+            childIds: finalChildIds,
+          });
+          linksCreated += finalChildIds.length;
+        } catch (e) {
+          this.logger.warn(
+            `Failed to link row ${pk} during text→link conversion: ${
+              (e as Error).message
+            }`,
+          );
+        }
+      },
+    );
 
     return { linksCreated, valuesUnmatched };
   }
@@ -6467,6 +6504,9 @@ export class ColumnsService implements IColumnsService {
       dbDriver,
     });
 
+    // Cap the synchronous conversion at a manageable table size (forward only).
+    await this.assertConvertibleRowCount(context, baseModel);
+
     // Display-value column of the related records (custom override or PV).
     const groupCtx = await getLtarDisplayValueContext(context, column);
     const dvTitle = groupCtx.displayValueColumn.title;
@@ -6556,16 +6596,19 @@ export class ColumnsService implements IColumnsService {
       // Resolve each row's linked records with bounded concurrency — one
       // sequential `readLinked` per row would serialize N read round-trips on
       // a large table.
-      const pageRows = await processConcurrently(page, async (row) => {
-        const pk = baseModel.extractPksValues(row, true);
-        const linked = await readLinked(pk);
-        if (!linked.length) return null;
-        const text = linked
-          .map((r) => (r == null ? null : r[dvTitle]))
-          .filter((v) => v !== null && v !== undefined && String(v).length > 0)
-          .join(delimiter);
-        return text.length ? { pk, text } : null;
-      });
+      const pageRows = await processConcurrently(
+        page,
+        async (row) => {
+          const pk = baseModel.extractPksValues(row, true);
+          const linked = await readLinked(pk);
+          if (!linked.length) return null;
+          const text = linked
+            .map((r) => (r == null ? null : r[dvTitle]))
+            .filter((v) => v !== null && v !== undefined && String(v).length > 0)
+            .join(delimiter);
+          return text.length ? { pk, text } : null;
+        },
+      );
       for (const r of pageRows) if (r) rows.push(r);
       if (page.length < PAGE) break;
       offset += PAGE;
