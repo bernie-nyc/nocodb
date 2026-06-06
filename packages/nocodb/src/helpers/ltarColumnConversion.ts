@@ -764,10 +764,19 @@ export const ltarColumnConversion = (svc: IColumnConversionHost) => {
       // Bounded-concurrent per-row updates instead of one sequential await per
       // row; each row targets a distinct pk so the writes don't collide.
       await processConcurrently(rows, async (r) => {
-        await baseModel
-          .dbDriver(tnPath)
-          .update({ [textColumn.column_name]: r.text })
-          .where(pkCn, r.pk);
+        // Route through execAndParse, not a bare builder await: for mux/external
+        // sources `baseModel.dbDriver` is a pool-less local knex that ships SQL
+        // to the executor. Awaiting the builder directly hits the (nonexistent)
+        // local pool and throws "Unable to acquire a connection". Mirrors every
+        // other write here (addLinks) and in add-remove-links.ts.
+        await baseModel.execAndParse(
+          baseModel
+            .dbDriver(tnPath)
+            .update({ [textColumn.column_name]: r.text })
+            .where(pkCn, r.pk),
+          null,
+          { raw: true },
+        );
       });
     }
 
