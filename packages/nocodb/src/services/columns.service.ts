@@ -6443,11 +6443,21 @@ export class ColumnsService implements IColumnsService {
           )) || []
         );
       }
-      // bt / mo / oo — single linked record.
-      const rec = await baseModel.mmRead(
-        { colId: column.id, parentId: pk },
-        { fieldsSet: dvSet },
-      );
+      // bt / mo / oo — single linked record. V2 links (mo, V2 oo, and any
+      // single-target link backed by a junction) resolve through `mmRead`.
+      // V1 `bt`/`oo` are junction-less: `mmRead` returns null for every row
+      // (no mm model to read through), which would silently empty the column
+      // before the forward path hard-deletes the link. Discriminate by
+      // junction presence and read junction-less links via `btRead` instead.
+      const hasJunction = !!(
+        groupCtx.colOptions as { fk_mm_model_id?: string }
+      ).fk_mm_model_id;
+      const rec = hasJunction
+        ? await baseModel.mmRead(
+            { colId: column.id, parentId: pk },
+            { fieldsSet: dvSet },
+          )
+        : await baseModel.btRead({ colId: column.id, id: pk }, { fieldSet: dvSet });
       return rec ? (Array.isArray(rec) ? rec : [rec]) : [];
     };
 
