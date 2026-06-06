@@ -143,11 +143,13 @@ import { MetaDependencyEventHandler } from '~/services/meta-dependency/event-han
 import { getRelatedModelMap } from '~/utils/getRelatedModelMap';
 import { processConcurrently } from '~/utils/dataUtils';
 
-// Hard cap on table size for a synchronous (in-request) text↔link conversion.
-// Above this the per-row link read/write would risk a request timeout; reject
-// with a clear error rather than start an op that can't finish. (A background-
-// job path can lift this later)
-const LTAR_CONVERSION_MAX_ROWS = 10_000;
+// Hard cap on the number of rows a synchronous (in-request) text↔link
+// conversion will process. Above this the per-row link read/write would risk a
+// request timeout; reject with a clear error rather than start an op that can't
+// finish. text→link counts only rows whose source cell has a value (the rows
+// it actually links); link→text counts all rows (it reads every row's links).
+// (A background-job path can lift this later.)
+const LTAR_CONVERSION_MAX_ROWS = 5_000;
 import { validateColumnInternalMeta } from '~/types/column-internal-meta';
 import { backfillAutoNumber } from '~/helpers/autonumberHelpers';
 
@@ -6041,18 +6043,35 @@ export class ColumnsService implements IColumnsService {
    * front with a clear message. Skipped under replay (undo/redo/sandbox merge):
    * those must always complete, and the forward already enforced the cap so the
    * table can't have grown past it through the conversion.
+   *
+   * `sourceColumn` scopes the count to the rows the op actually touches:
+   *  - text→link: pass the source text column → count only rows whose cell has
+   *    a value (the rows that get linked), not the whole table.
+   *  - link→text: omit it → count all rows (every row's links are read).
    */
   protected async assertConvertibleRowCount(
     context: NcContext,
     baseModel: Awaited<ReturnType<typeof Model.getBaseModelSQL>>,
+    sourceColumn?: Column,
   ): Promise<void> {
     if (isReplay()) return;
-    const rowCount = Number(await baseModel.count({}, true));
+    // text→link only counts rows with a non-blank source cell (the rows it
+    // links); link→text counts the whole table. `notblank` excludes both null
+    // and empty string, matching the conversion's own per-row value filter.
+    const filterArr = sourceColumn
+      ? [
+          new Filter({
+            fk_column_id: sourceColumn.id,
+            comparison_op: 'notblank',
+          } as Filter),
+        ]
+      : undefined;
+    const rowCount = Number(await baseModel.count({ filterArr }, true));
     if (Number.isFinite(rowCount) && rowCount > LTAR_CONVERSION_MAX_ROWS) {
       NcError.get(context).badRequest(
-        `Cannot convert: this table has ${rowCount.toLocaleString()} records, ` +
-          `which exceeds the ${LTAR_CONVERSION_MAX_ROWS.toLocaleString()}-record ` +
-          `limit for converting between text and link fields.`,
+        `Cannot convert: this conversion would process ${rowCount.toLocaleString()} ` +
+          `records, which exceeds the ${LTAR_CONVERSION_MAX_ROWS.toLocaleString()}-` +
+          `record limit for converting between text and link fields.`,
       );
     }
   }
@@ -6119,10 +6138,11 @@ export class ColumnsService implements IColumnsService {
       dbDriver,
     });
 
-    // Cap the synchronous conversion at a manageable table size — only on the
-    // real forward request (undo/redo/sandbox replay must always finish, and
-    // the forward already enforced the cap, so the table can't be larger).
-    await this.assertConvertibleRowCount(context, baseModel);
+    // Cap the synchronous conversion at a manageable size — only on the real
+    // forward request (undo/redo/sandbox replay must always finish, and the
+    // forward already enforced the cap). text→link only links rows that have a
+    // value, so count those rows, not the whole table.
+    await this.assertConvertibleRowCount(context, baseModel, column);
 
     await table.getColumns(context);
     const pkTitles = table.primaryKeys.map((pk) => pk.title);
