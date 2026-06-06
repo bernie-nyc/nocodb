@@ -6535,21 +6535,34 @@ export class ColumnsService implements IColumnsService {
     await table.getColumns(context);
     const pkTitle = table.primaryKeys[0]?.title;
 
+    // V2 links (om/mo/mm and V2 oo) are junction-backed; V1 links (hm/bt) are
+    // FK-based. The correct reader depends on that split, not on the relation
+    // type alone — so resolve it once and branch on it below.
+    const hasJunction = !!(
+      groupCtx.colOptions as { fk_mm_model_id?: string }
+    ).fk_mm_model_id;
+
     const readLinked = async (pk: string | number): Promise<any[]> => {
       const dvSet = new Set([dvTitle]);
-      if (relType === RelationTypes.MANY_TO_MANY) {
-        return (
-          (await baseModel.mmList(
-            { colId: column.id, parentId: pk },
-            { fieldsSet: dvSet },
-            true,
-          )) || []
-        );
-      }
+      // Multi-target links (mm / hm / om): many linked records per row.
       if (
+        relType === RelationTypes.MANY_TO_MANY ||
         relType === RelationTypes.HAS_MANY ||
         relType === RelationTypes.ONE_TO_MANY
       ) {
+        // Junction-backed (mm + every V2 link, incl. om) → `mmList`. Only the
+        // V1 FK-based `hm` reads via `hmList`: routing a junction-backed `om`
+        // there finds no local FK, so it reads the wrong rows and emits the
+        // parent row's own display value instead of the children's.
+        if (hasJunction) {
+          return (
+            (await baseModel.mmList(
+              { colId: column.id, parentId: pk },
+              { fieldsSet: dvSet },
+              true,
+            )) || []
+          );
+        }
         return (
           (await baseModel.hmList(
             { colId: column.id, id: pk },
@@ -6559,9 +6572,6 @@ export class ColumnsService implements IColumnsService {
       }
       // bt / mo / oo — single linked record. V2 links (mo, V2 oo, and any
       // single-target link backed by a junction) resolve through `mmRead`.
-      const hasJunction = !!(
-        groupCtx.colOptions as { fk_mm_model_id?: string }
-      ).fk_mm_model_id;
       if (hasJunction) {
         const rec = await baseModel.mmRead(
           { colId: column.id, parentId: pk },
