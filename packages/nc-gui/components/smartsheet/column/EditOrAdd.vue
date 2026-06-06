@@ -240,7 +240,13 @@ const uiFilters = (t: UiTypesType) => {
   if (isMmTable && isSystemField(t)) return false
 
   const systemFiledNotEdited = !isSystemField(t) || formState.value.uidt === t.name || !isEdit.value
-  const isVirtualEditAllowed = !isEdit.value || !t.virtual || t.name === formState.value.uidt
+
+  // Converting an existing SingleLineText column into a link (LTAR) is
+  // supported — cell text is resolved to related records on save. Allow LTAR
+  // through the edit-mode virtual/LTAR guards for that one source type.
+  const isTextToLtar = isEdit.value && column?.value?.uidt === UITypes.SingleLineText && t.name === UITypes.LinkToAnotherRecord
+
+  const isVirtualEditAllowed = !isEdit.value || !t.virtual || t.name === formState.value.uidt || isTextToLtar
   const specificDBType = t.name === UITypes.SpecificDBType && isXcdbBase(meta.value?.source_id)
   const showDeprecatedField = !t.deprecated || showDeprecated.value
 
@@ -250,7 +256,7 @@ const uiFilters = (t: UiTypesType) => {
   const showColourField = t.name === UITypes.Colour ? isEeUI && showEEFeatures.value : true
   const isAllowToAddInFormView = isForm.value ? !isFormViewHiddenCol(t.name as UITypes) : true
 
-  const showLTAR = t.name === UITypes.LinkToAnotherRecord ? !isEdit.value : true
+  const showLTAR = t.name === UITypes.LinkToAnotherRecord ? !isEdit.value || isTextToLtar : true
 
   let formulaColumnTypeValid = true
   if (column?.value?.uidt === UITypes.Formula) {
@@ -282,6 +288,13 @@ const uiFilters = (t: UiTypesType) => {
     showAutoNumber
   )
 }
+
+// Converting an existing SingleLineText column into a link: the field is
+// edited, but the LTAR options sub-component must behave like create mode so
+// it surfaces the related-table / relation-type pickers and validation.
+const isTextToLtarConversion = computed(
+  () => isEdit.value && column?.value?.uidt === UITypes.SingleLineText && formState.value.uidt === UITypes.LinkToAnotherRecord,
+)
 
 const extraIcons = ref<Record<string, string>>({})
 
@@ -1419,7 +1432,7 @@ const unique = computed({
           v-if="isLinksOrLTAR(formState.uidt)"
           :key="`${formState.uidt}-${formState.id || 'new'}`"
           v-model:value="formState"
-          :is-edit="isEdit"
+          :is-edit="isEdit && !isTextToLtarConversion"
           @upgrade="isConvertLinkV2ModalOpen = true"
         />
         <SmartsheetColumnPercentOptions v-if="formState.uidt === UITypes.Percent" v-model:value="formState" />

@@ -126,6 +126,10 @@ import { FiltersService } from '~/services/filters.service';
 import { DuplicateDetectionService } from '~/services/duplicate-detection.service';
 import { LinkPlaceholderService } from '~/services/link-placeholder.service';
 import NcConnectionMgrv2 from '~/utils/common/NcConnectionMgrv2';
+import {
+  getLtarDisplayValueContext,
+  resolveLtarDisplayValuesToPks,
+} from '~/helpers/ltarDisplayValueResolver';
 import { validateUniqueConstraint } from '~/helpers/uniqueConstraintHelpers';
 import {
   convertAIRecordTypeToValue,
@@ -1639,6 +1643,54 @@ export class ColumnsService implements IColumnsService {
           `Updating ${column.uidt} => ${colBody.uidt}`,
         );
       }
+    } else if (
+      isLinksOrLTAR(colBody.uidt) &&
+      column.uidt === UITypes.SingleLineText
+    ) {
+      // Convert a plain text column into a link (LTAR) field: create the
+      // relationship, then backfill links by resolving each row's cell text
+      // to related records (display-value match, append-only). This replaces
+      // the source column outright, so it returns early instead of falling
+      // through to the in-place-update tail (which targets the now-deleted
+      // source column id).
+      const ltarColumn = await this.convertSingleLineTextToLtar(context, {
+        column,
+        colBody,
+        table,
+        source,
+        user: param.user,
+        req,
+        reuse: param.reuse,
+      });
+
+      await table.getColumns(context);
+
+      this.appHooksService.emit(AppEvents.COLUMN_UPDATE, {
+        table,
+        oldColumn: column,
+        column: ltarColumn,
+        columnId: ltarColumn.id,
+        req: param.req,
+        context,
+        columns: table.columns,
+      });
+
+      NocoSocket.broadcastEvent(
+        context,
+        {
+          event: EventType.META_EVENT,
+          payload: {
+            action: 'column_update',
+            payload: {
+              table,
+              column: ltarColumn,
+            },
+          },
+        },
+        context.socket_id,
+      );
+
+      return table;
     } else if (
       [
         UITypes.Lookup,
@@ -5812,6 +5864,214 @@ export class ColumnsService implements IColumnsService {
       );
     }
   };
+
+  /**
+   * Convert a SingleLineText column into a link (LTAR) field.
+   *
+   * Flow: snapshot the existing text per row → create the LTAR column (with a
+   * temporary title so it doesn't clash with the source column) → backfill
+   * links by resolving each row's cell text to related records → drop the
+   * source text column → rename the LTAR to the source column's title/order
+   * so the field "becomes" the link.
+   *
+   * Backfill is append-only, runs synchronously (matching other column ops),
+   * skips unmatched values, and for single-link relations takes the first
+   * match. `colBody.meta.delimiter` (default ',') splits multi-value cells.
+   *
+   * NOTE: undo/redo + sandbox replay of this compound conversion are not yet
+   * wired — the LTAR creation deposits its side-effect ids, but reversing the
+   * full operation (create + backfill + source drop) needs dedicated
+   * command-registry work. Tracked as a follow-up.
+   */
+  async convertSingleLineTextToLtar(
+    context: NcContext,
+    param: {
+      column: Column;
+      colBody: Column & { meta?: Record<string, any> };
+      table: Model;
+      source: Source;
+      user: UserType;
+      req: NcRequest;
+      reuse?: ReusableParams;
+    },
+  ) {
+    const { column, colBody, table, source, user, req } = param;
+    const reuse = param.reuse ?? {};
+
+    const originalTitle = column.title;
+    const originalOrder = column.order;
+    const delimiter = (colBody.meta?.delimiter as string) || ',';
+
+    const base = await reuseOrSave('base', reuse, async () =>
+      source.getProject(context),
+    );
+
+    const dbDriver = await reuseOrSave('dbDriver', reuse, async () =>
+      NcConnectionMgrv2.get(source),
+    );
+    const baseModel = await reuseOrSave('baseModel', reuse, async () =>
+      Model.getBaseModelSQL(context, { id: table.id, dbDriver }),
+    );
+
+    await table.getColumns(context);
+    const pkTitles = table.primaryKeys.map((pk) => pk.title);
+
+    // Snapshot (pk, text) for every row that has a value, before any schema
+    // change. Paged to keep memory bounded on large tables.
+    const snapshot: { pk: string | number; text: string }[] = [];
+    const PAGE = 1000;
+    let offset = 0;
+    for (;;) {
+      const page = await baseModel.list(
+        {
+          fieldsSet: new Set([...pkTitles, column.title]),
+          limit: PAGE,
+          offset,
+        },
+        { ignoreViewFilterAndSort: true },
+      );
+      if (!page.length) break;
+      for (const row of page) {
+        const text = row[column.title];
+        if (text === null || text === undefined || String(text).trim() === '') {
+          continue;
+        }
+        snapshot.push({
+          pk: baseModel.extractPksValues(row, true),
+          text: String(text),
+        });
+      }
+      if (page.length < PAGE) break;
+      offset += PAGE;
+    }
+
+    // Create the LTAR column with a temporary title to avoid clashing with the
+    // still-present source column. `colBody` already carries the relationship
+    // config (parentId/childId/type) from the field-edit modal.
+    const tempTitle = `${originalTitle}_link_${enumRebuildSuffix()}`;
+    const ltarReq = {
+      ...colBody,
+      title: tempTitle,
+    };
+    const ltarCapture: LtarSideEffectIds = {};
+    const ltarColumn = await this.createLTARColumn(context, {
+      tableId: table.id,
+      column: ltarReq as unknown as ColumnReqType,
+      source,
+      base,
+      user,
+      req,
+      reuse,
+      _ltarCapture: ltarCapture,
+    });
+    captureForTrace('ltar', ltarCapture);
+
+    // Backfill links from the snapshot.
+    const linkStats = await this.backfillLtarFromText(context, {
+      baseModel,
+      ltarColumn,
+      snapshot,
+      delimiter,
+      req,
+    });
+    this.logger.log(
+      `Converted "${originalTitle}" to link: ${linkStats.linksCreated} links created, ${linkStats.valuesUnmatched} unmatched.`,
+    );
+
+    // Drop the source text column, then give the LTAR the original title/order
+    // so the field morphs in place.
+    await this.columnDelete(
+      context,
+      { columnId: column.id, req, reuse },
+      this.metaService,
+    );
+
+    await Column.update(context, ltarColumn.id, {
+      ...ltarColumn,
+      title: originalTitle,
+      order: originalOrder,
+    } as Column);
+
+    return ltarColumn;
+  }
+
+  /**
+   * Resolve the snapshot's display values to related-record pks and create the
+   * links via `addLinks` (append-only). Returns counts for logging.
+   */
+  protected async backfillLtarFromText(
+    context: NcContext,
+    params: {
+      baseModel: Awaited<ReturnType<typeof Model.getBaseModelSQL>>;
+      ltarColumn: Column;
+      snapshot: { pk: string | number; text: string }[];
+      delimiter: string;
+      req: NcRequest;
+    },
+  ): Promise<{ linksCreated: number; valuesUnmatched: number }> {
+    const { baseModel, ltarColumn, snapshot, delimiter, req } = params;
+    if (!snapshot.length) return { linksCreated: 0, valuesUnmatched: 0 };
+
+    const groupCtx = await getLtarDisplayValueContext(context, ltarColumn);
+
+    const perRow = snapshot.map(({ pk, text }) => {
+      const values = String(text)
+        .split(delimiter)
+        .map((v) => v.trim())
+        .filter((v) => v.length > 0);
+      return { pk, values };
+    });
+
+    const distinct = new Set<string>();
+    for (const r of perRow) for (const v of r.values) distinct.add(v);
+
+    const valueToPk = new Map<string, string | number>();
+    const distinctArr = [...distinct];
+    const RESOLVE_CHUNK = 200;
+    for (let i = 0; i < distinctArr.length; i += RESOLVE_CHUNK) {
+      const resolved = await resolveLtarDisplayValuesToPks(
+        groupCtx,
+        distinctArr.slice(i, i + RESOLVE_CHUNK),
+      );
+      for (const [k, v] of resolved) valueToPk.set(k, v);
+    }
+
+    let linksCreated = 0;
+    let valuesUnmatched = 0;
+    for (const { pk, values } of perRow) {
+      const seen = new Set<string>();
+      const childIds: (string | number)[] = [];
+      for (const v of values) {
+        const matched = valueToPk.get(v);
+        if (matched === undefined || matched === null) {
+          valuesUnmatched += 1;
+          continue;
+        }
+        const key = String(matched);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        childIds.push(matched);
+      }
+      if (!childIds.length) continue;
+
+      const finalChildIds = groupCtx.isSingleLink ? [childIds[0]] : childIds;
+      try {
+        await baseModel.addLinks({
+          cookie: req,
+          colId: ltarColumn.id,
+          rowId: String(pk),
+          childIds: finalChildIds,
+        });
+        linksCreated += finalChildIds.length;
+      } catch (e) {
+        this.logger.warn(
+          `Failed to link row ${pk} during text→link conversion: ${e.message}`,
+        );
+      }
+    }
+
+    return { linksCreated, valuesUnmatched };
+  }
 
   async createLTARColumn(
     context: NcContext,
