@@ -1441,6 +1441,7 @@ const unique = computed({
           :key="`${formState.uidt}-${formState.id || 'new'}`"
           v-model:value="formState"
           :is-edit="isEdit && !isTextToLtarConversion"
+          :hide-advanced-options="isTextToLtarConversion"
           @upgrade="isConvertLinkV2ModalOpen = true"
         />
         <SmartsheetColumnPercentOptions v-if="formState.uidt === UITypes.Percent" v-model:value="formState" />
@@ -1720,7 +1721,7 @@ const unique = computed({
                   type="primary"
                   :theme="isAiMode ? 'ai' : 'default'"
                   :loading="saving"
-                  :disabled="!formState.uidt || disableSubmitBtn || saving"
+                  :disabled="!formState.uidt || disableSubmitBtn || saving || (isTextToLtarConversion && !formState.childId)"
                   size="small"
                   :label="submitBtnLabel.label"
                   :loading-label="submitBtnLabel.loadingLabel"
