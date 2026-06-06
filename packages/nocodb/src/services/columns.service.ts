@@ -141,6 +141,7 @@ import NocoSocket from '~/socket/NocoSocket';
 import { DBErrorExtractor } from '~/helpers/db-error/extractor';
 import { MetaDependencyEventHandler } from '~/services/meta-dependency/event-handler.service';
 import { getRelatedModelMap } from '~/utils/getRelatedModelMap';
+import { processConcurrently } from '~/utils/dataUtils';
 import { validateColumnInternalMeta } from '~/types/column-internal-meta';
 import { backfillAutoNumber } from '~/helpers/autonumberHelpers';
 
@@ -6308,7 +6309,12 @@ export class ColumnsService implements IColumnsService {
 
     let linksCreated = 0;
     let valuesUnmatched = 0;
-    for (const { pk, values } of perRow) {
+    // Apply links with bounded concurrency instead of one sequential await per
+    // row — a large table would otherwise serialize N `addLinks` round-trips.
+    // Mirrors the data-import link phase. The counters are mutated only in
+    // synchronous (post-await) statements, so single-threaded JS keeps them
+    // race-free; each `pk` is distinct so concurrent writes never collide.
+    await processConcurrently(perRow, async ({ pk, values }) => {
       const seen = new Set<string>();
       const childIds: (string | number)[] = [];
       for (const v of values) {
@@ -6322,7 +6328,7 @@ export class ColumnsService implements IColumnsService {
         seen.add(key);
         childIds.push(matched);
       }
-      if (!childIds.length) continue;
+      if (!childIds.length) return;
 
       const finalChildIds = groupCtx.isSingleLink ? [childIds[0]] : childIds;
       try {
@@ -6335,10 +6341,12 @@ export class ColumnsService implements IColumnsService {
         linksCreated += finalChildIds.length;
       } catch (e) {
         this.logger.warn(
-          `Failed to link row ${pk} during text→link conversion: ${e.message}`,
+          `Failed to link row ${pk} during text→link conversion: ${
+            (e as Error).message
+          }`,
         );
       }
-    }
+    });
 
     return { linksCreated, valuesUnmatched };
   }
@@ -6545,16 +6553,20 @@ export class ColumnsService implements IColumnsService {
         { ignoreViewFilterAndSort: true },
       );
       if (!page.length) break;
-      for (const row of page) {
+      // Resolve each row's linked records with bounded concurrency — one
+      // sequential `readLinked` per row would serialize N read round-trips on
+      // a large table.
+      const pageRows = await processConcurrently(page, async (row) => {
         const pk = baseModel.extractPksValues(row, true);
         const linked = await readLinked(pk);
-        if (!linked.length) continue;
+        if (!linked.length) return null;
         const text = linked
           .map((r) => (r == null ? null : r[dvTitle]))
           .filter((v) => v !== null && v !== undefined && String(v).length > 0)
           .join(delimiter);
-        if (text.length) rows.push({ pk, text });
-      }
+        return text.length ? { pk, text } : null;
+      });
+      for (const r of pageRows) if (r) rows.push(r);
       if (page.length < PAGE) break;
       offset += PAGE;
     }
@@ -6594,11 +6606,13 @@ export class ColumnsService implements IColumnsService {
     const pkCn = table.primaryKeys[0]?.column_name;
     if (rows.length && pkCn) {
       const tnPath = baseModel.getTnPath(table.table_name);
-      for (const r of rows) {
+      // Bounded-concurrent per-row updates instead of one sequential await per
+      // row; each row targets a distinct pk so the writes don't collide.
+      await processConcurrently(rows, async (r) => {
         await baseModel.dbDriver(tnPath)
           .update({ [textColumn.column_name]: r.text })
           .where(pkCn, r.pk);
-      }
+      });
     }
 
     // Drop the link column (skipTrash so undo can recreate it with the same
