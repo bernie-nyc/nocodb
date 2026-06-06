@@ -1653,7 +1653,7 @@ export class ColumnsService implements IColumnsService {
       // the source column outright, so it returns early instead of falling
       // through to the in-place-update tail (which targets the now-deleted
       // source column id).
-      const ltarColumn = await this.convertSingleLineTextToLtar(context, {
+      const ltarColumnId = await this.convertSingleLineTextToLtar(context, {
         column,
         colBody,
         table,
@@ -1663,34 +1663,61 @@ export class ColumnsService implements IColumnsService {
         reuse: param.reuse,
       });
 
-      await table.getColumns(context);
+      const freshTable = await Model.get(context, table.id);
+      await freshTable.getColumns(context);
+      const ltarColumn = await Column.get(context, { colId: ltarColumnId });
 
-      this.appHooksService.emit(AppEvents.COLUMN_UPDATE, {
-        table,
-        oldColumn: column,
-        column: ltarColumn,
-        columnId: ltarColumn.id,
-        req: param.req,
-        context,
-        columns: table.columns,
-      });
+      // Creating the mm relation makes the loaded column graph circular
+      // (LTAR → relatedTable → columns → … → back-link → relatedTable),
+      // which JSON.stringify (HTTP response / socket broadcast) can't handle.
+      // Build a serialization-safe clone for the wire payloads.
+      const jsonSafe = <T>(value: T): T => {
+        const seen = new WeakSet();
+        return JSON.parse(
+          JSON.stringify(value, (_k, v) => {
+            if (v && typeof v === 'object') {
+              if (seen.has(v)) return undefined;
+              seen.add(v);
+            }
+            return v;
+          }),
+        );
+      };
+      const safeTable = jsonSafe(freshTable);
 
-      NocoSocket.broadcastEvent(
-        context,
-        {
-          event: EventType.META_EVENT,
-          payload: {
-            action: 'column_update',
+      // Best-effort notification — the conversion is already committed.
+      try {
+        this.appHooksService.emit(AppEvents.COLUMN_UPDATE, {
+          table: freshTable,
+          oldColumn: column,
+          column: ltarColumn,
+          columnId: ltarColumnId,
+          req: param.req,
+          context,
+          columns: safeTable.columns,
+        });
+
+        NocoSocket.broadcastEvent(
+          context,
+          {
+            event: EventType.META_EVENT,
             payload: {
-              table,
-              column: ltarColumn,
+              action: 'column_update',
+              payload: {
+                table: safeTable,
+                column: jsonSafe(ltarColumn),
+              },
             },
           },
-        },
-        context.socket_id,
-      );
+          context.socket_id,
+        );
+      } catch (e) {
+        this.logger.warn(
+          `text→link post-update notification failed: ${e.message}`,
+        );
+      }
 
-      return table;
+      return safeTable;
     } else if (
       [
         UITypes.Lookup,
@@ -5896,22 +5923,21 @@ export class ColumnsService implements IColumnsService {
     },
   ) {
     const { column, colBody, table, source, user, req } = param;
-    const reuse = param.reuse ?? {};
 
     const originalTitle = column.title;
-    const originalOrder = column.order;
     const delimiter = (colBody.meta?.delimiter as string) || ',';
 
-    const base = await reuseOrSave('base', reuse, async () =>
-      source.getProject(context),
-    );
-
-    const dbDriver = await reuseOrSave('dbDriver', reuse, async () =>
-      NcConnectionMgrv2.get(source),
-    );
-    const baseModel = await reuseOrSave('baseModel', reuse, async () =>
-      Model.getBaseModelSQL(context, { id: table.id, dbDriver }),
-    );
+    // Build local handles for the snapshot read. Do NOT share these (or the
+    // caller's `reuse`) with createLTARColumn/columnDelete below — passing
+    // mutated Model/baseModel instances through their `reuse` pollutes the meta
+    // cache and breaks `hash(columns)` in a later `Model.get`. Each sub-op gets
+    // a fresh reuse, exactly like a standalone columnAdd/columnDelete.
+    const base = await source.getProject(context);
+    const dbDriver = await NcConnectionMgrv2.get(source);
+    const baseModel = await Model.getBaseModelSQL(context, {
+      id: table.id,
+      dbDriver,
+    });
 
     await table.getColumns(context);
     const pkTitles = table.primaryKeys.map((pk) => pk.title);
@@ -5946,11 +5972,23 @@ export class ColumnsService implements IColumnsService {
     }
 
     // Create the LTAR column with a temporary title to avoid clashing with the
-    // still-present source column. `colBody` already carries the relationship
-    // config (parentId/childId/type) from the field-edit modal.
+    // still-present source column. `colBody` carries the relationship config
+    // (parentId/childId/type) from the field-edit modal, but it is the SOURCE
+    // text column's body — strip its identity (id / column_name / fk_model_id /
+    // colOptions / order) so a fresh LTAR column is created instead of trying
+    // to reuse the source column's id.
     const tempTitle = `${originalTitle}_link_${enumRebuildSuffix()}`;
+    const {
+      id: _id,
+      column_name: _columnName,
+      fk_model_id: _fkModelId,
+      fk_column_id: _fkColumnId,
+      colOptions: _colOptions,
+      order: _order,
+      ...ltarRest
+    } = colBody as Record<string, any>;
     const ltarReq = {
-      ...colBody,
+      ...ltarRest,
       title: tempTitle,
     };
     const ltarCapture: LtarSideEffectIds = {};
@@ -5961,12 +5999,32 @@ export class ColumnsService implements IColumnsService {
       base,
       user,
       req,
-      reuse,
+      reuse: {},
       _ltarCapture: ltarCapture,
     });
     captureForTrace('ltar', ltarCapture);
 
-    // Backfill links from the snapshot.
+    // Drop the source text column and rename the LTAR to the original title
+    // BEFORE backfilling. The schema steps recompute the parent model's
+    // columnsHash; running them before the link backfill keeps that hash off
+    // the meta cache state that the backfill's record reads/links churn (which
+    // can transiently leave lazy-loaded promises on cached models and crash
+    // object-hash). Use the simple-update path (title only) — a full
+    // `Column.update` would re-process the LTAR relationship.
+    await this.columnDelete(
+      context,
+      { columnId: column.id, req, reuse: {} },
+      this.metaService,
+    );
+
+    await Column.update2(context, {
+      colId: ltarColumn.id,
+      column: { title: originalTitle },
+      isSimpleUpdate: true,
+    });
+
+    // Backfill links from the snapshot (runs last — no more columnsHash in this
+    // flow after this point).
     const linkStats = await this.backfillLtarFromText(context, {
       baseModel,
       ltarColumn,
@@ -5978,21 +6036,7 @@ export class ColumnsService implements IColumnsService {
       `Converted "${originalTitle}" to link: ${linkStats.linksCreated} links created, ${linkStats.valuesUnmatched} unmatched.`,
     );
 
-    // Drop the source text column, then give the LTAR the original title/order
-    // so the field morphs in place.
-    await this.columnDelete(
-      context,
-      { columnId: column.id, req, reuse },
-      this.metaService,
-    );
-
-    await Column.update(context, ltarColumn.id, {
-      ...ltarColumn,
-      title: originalTitle,
-      order: originalOrder,
-    } as Column);
-
-    return ltarColumn;
+    return ltarColumn.id;
   }
 
   /**
