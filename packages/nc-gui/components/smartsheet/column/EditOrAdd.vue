@@ -167,8 +167,16 @@ const onMouseOverUniqueValuesInfoIcon = ref(false)
 
 const columnUidt = computed({
   get: () => {
-    // Show legacy LTAR v1 columns as "Links" in the type dropdown
-    if (isEdit.value && formState.value.uidt === UITypes.LinkToAnotherRecord && formState.value.colOptions?.version !== 2) {
+    // Show legacy LTAR v1 columns as "Links" in the type dropdown — but only
+    // when editing an existing link column. When converting another type
+    // (e.g. SingleLineText) into a link, the new field has no version yet, so
+    // this would wrongly relabel the freshly chosen "Link to another record".
+    if (
+      isEdit.value &&
+      column?.value?.uidt === UITypes.LinkToAnotherRecord &&
+      formState.value.uidt === UITypes.LinkToAnotherRecord &&
+      formState.value.colOptions?.version !== 2
+    ) {
       return UITypes.Links
     }
     return formState.value.uidt
