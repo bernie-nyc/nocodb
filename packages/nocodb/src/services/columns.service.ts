@@ -5952,6 +5952,74 @@ export class ColumnsService implements IColumnsService {
   };
 
   /**
+   * Emit the final, authoritative `COLUMN_UPDATE` audit event + meta socket
+   * broadcast for a completed column type-conversion. The forward path does
+   * this inline in `columnUpdate`; the undo/redo inverses
+   * ({@link revertTextColumnToLink} / {@link revertLinkColumnToText}) call this
+   * so the frontend (which refreshes purely from realtime events) replaces the
+   * transient temp-named column from `createLTARColumn`/`columnAdd` with the
+   * final renamed column + its data. Best-effort — the schema change is already
+   * committed, so a notification failure must not abort the op.
+   */
+  protected async broadcastColumnConversion(
+    context: NcContext,
+    param: {
+      tableId: string;
+      columnId: string;
+      oldColumn?: Column;
+      req: NcRequest;
+    },
+  ) {
+    try {
+      const freshTable = await Model.get(context, param.tableId);
+      if (!freshTable) return;
+      await freshTable.getColumns(context);
+      const column = await Column.get(context, { colId: param.columnId });
+      if (!column) return;
+
+      // The new relation can make the loaded column graph circular — build a
+      // serialization-safe clone for the wire payloads.
+      const seen = new WeakSet();
+      const safeTable = JSON.parse(
+        JSON.stringify(freshTable, (_k, v) => {
+          if (v && typeof v === 'object') {
+            if (seen.has(v)) return undefined;
+            seen.add(v);
+          }
+          return v;
+        }),
+      );
+
+      this.appHooksService.emit(AppEvents.COLUMN_UPDATE, {
+        table: freshTable,
+        oldColumn: param.oldColumn ?? column,
+        column,
+        columnId: param.columnId,
+        req: param.req,
+        context,
+        columns: safeTable.columns,
+      });
+      NocoSocket.broadcastEvent(
+        context,
+        {
+          event: EventType.META_EVENT,
+          payload: {
+            action: 'column_update',
+            payload: { table: safeTable, column },
+          },
+        },
+        context.socket_id,
+      );
+    } catch (e) {
+      this.logger.warn(
+        `column conversion notification failed for ${param.columnId}: ${
+          (e as Error).message
+        }`,
+      );
+    }
+  }
+
+  /**
    * Convert a SingleLineText column into a link (LTAR) field.
    *
    * Flow: snapshot the existing text per row → create the LTAR column (with a
@@ -6306,6 +6374,14 @@ export class ColumnsService implements IColumnsService {
       }
     }
 
+    // Tell the frontend (which refreshes from realtime events only) the final
+    // recreated text column, replacing the transient one from columnAdd.
+    await this.broadcastColumnConversion(context, {
+      tableId,
+      columnId: textColumn.id,
+      req,
+    });
+
     return Column.get(context, { colId: textColumn.id });
   }
 
@@ -6538,6 +6614,15 @@ export class ColumnsService implements IColumnsService {
       table,
       source,
       user: req.user as UserType,
+      req,
+    });
+
+    // Tell the frontend (which refreshes from realtime events only) the final
+    // recreated link column, replacing the transient temp-named one that
+    // `createLTARColumn` broadcast mid-conversion.
+    await this.broadcastColumnConversion(context, {
+      tableId: table.id,
+      columnId: link.id,
       req,
     });
 
