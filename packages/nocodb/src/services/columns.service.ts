@@ -6047,6 +6047,21 @@ export class ColumnsService implements IColumnsService {
       user: UserType;
       req: NcRequest;
       reuse?: ReusableParams;
+      /**
+       * Set only when undoing a junction-less `bt`→text conversion. The forward
+       * dropped the whole hm/bt pair; here we recreate it from the `hm`
+       * perspective (so `createHmAndBtColumn` rebuilds the right relationship),
+       * but the user-facing column to restore is the *reverse* (`bt`) column,
+       * not the saved (`hm`) one. So: rename the reverse column to the user
+       * title + give the saved column its own captured title, and backfill the
+       * links onto the reverse (`bt`) column. Defaults off — every other caller
+       * keeps the original single-column rename/backfill behavior.
+       */
+      reverseRestore?: {
+        reverseColumnId: string;
+        savedColumnTitle: string;
+        reverseColumnTitle: string;
+      };
     },
   ) {
     const { column, colBody, table, source, user, req } = param;
@@ -6197,17 +6212,40 @@ export class ColumnsService implements IColumnsService {
       this.metaService,
     );
 
-    await Column.update2(context, {
-      colId: ltarColumn.id,
-      column: { title: originalTitle },
-      isSimpleUpdate: true,
-    });
+    if (param.reverseRestore) {
+      // hm/bt pair restore: `ltarColumn` is the saved (hm) column — keep its
+      // own captured title; the reverse (bt) column reclaims the user-facing
+      // title (the text column's slot it's replacing).
+      await Column.update2(context, {
+        colId: ltarColumn.id,
+        column: { title: param.reverseRestore.savedColumnTitle },
+        isSimpleUpdate: true,
+      });
+      await Column.update2(context, {
+        colId: param.reverseRestore.reverseColumnId,
+        column: { title: param.reverseRestore.reverseColumnTitle },
+        isSimpleUpdate: true,
+      });
+    } else {
+      await Column.update2(context, {
+        colId: ltarColumn.id,
+        column: { title: originalTitle },
+        isSimpleUpdate: true,
+      });
+    }
 
     // Backfill links from the snapshot (runs last — no more columnsHash in this
-    // flow after this point).
+    // flow after this point). In the hm/bt pair-restore case the snapshot is
+    // keyed by the bt-side rows, so links must be applied to the reverse (bt)
+    // column, not the saved (hm) one.
+    const backfillColumn = param.reverseRestore
+      ? (await Column.get(context, {
+          colId: param.reverseRestore.reverseColumnId,
+        })) ?? ltarColumn
+      : ltarColumn;
     const linkStats = await this.backfillLtarFromText(context, {
       baseModel,
-      ltarColumn,
+      ltarColumn: backfillColumn,
       snapshot,
       delimiter,
       req,
@@ -6581,6 +6619,8 @@ export class ColumnsService implements IColumnsService {
         fk_target_view_id?: string | null;
         fk_display_value_column_id?: string | null;
         meta?: Record<string, any> | string | null;
+        pairedColumnId?: string;
+        pairedColumnTitle?: string;
       };
       req: NcRequest;
     },
@@ -6597,6 +6637,58 @@ export class ColumnsService implements IColumnsService {
       NcError.get(context).tableNotFound(textColumn.fk_model_id);
     }
     const source = await Source.get(context, table.source_id);
+
+    // A junction-less `bt` is the reverse half of an hm/bt pair, and converting
+    // it dropped BOTH columns. Recreate the pair from the `hm` perspective so
+    // `createHmAndBtColumn` rebuilds the correct relationship, then map the
+    // original ids onto the right columns:
+    //   hm (saved column)   ← link.pairedColumnId  (via `convertedLinkId`)
+    //   bt (reverse column) ← link.id              (via `ltarReplayIds.reverseColumnId`)
+    // `link.parentId`/`childId` were captured from the bt's perspective
+    // (parentId = bt's own table, childId = the related/parent table), so swap
+    // them: the hm lives on the related table, the bt on its own table.
+    const pairedHmColumnId = link.pairedColumnId;
+    if (link.type === 'bt' && pairedHmColumnId) {
+      setReplay('convertedLinkId', pairedHmColumnId);
+      setReplay('ltarReplayIds', {
+        ...(getReplay('ltarReplayIds') ?? {}),
+        reverseColumnId: link.id,
+      });
+
+      const hmColBody = {
+        uidt: UITypes.LinkToAnotherRecord,
+        type: RelationTypes.HAS_MANY,
+        parentId: link.childId, // hm lives on the related (parent) table
+        childId: link.parentId, // bt lives on its own table
+        title: link.pairedColumnTitle ?? textColumn.title,
+        ...(link.ref_base_id ? { ref_base_id: link.ref_base_id } : {}),
+        ...(link.meta ? { meta: link.meta } : {}),
+      };
+
+      await this.convertSingleLineTextToLtar(context, {
+        column: textColumn,
+        colBody: hmColBody as unknown as Column & {
+          meta?: Record<string, any>;
+        },
+        table,
+        source,
+        user: req.user as UserType,
+        req,
+        reverseRestore: {
+          reverseColumnId: link.id,
+          savedColumnTitle: link.pairedColumnTitle ?? textColumn.title,
+          reverseColumnTitle: link.title ?? textColumn.title,
+        },
+      });
+
+      await this.broadcastColumnConversion(context, {
+        tableId: table.id,
+        columnId: link.id,
+        req,
+      });
+
+      return Column.get(context, { colId: link.id });
+    }
 
     // Reuse the original link column id when recreating it (honored by
     // `convertSingleLineTextToLtar` via `getReplay('convertedLinkId')`).
