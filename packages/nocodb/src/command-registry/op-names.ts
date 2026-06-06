@@ -23,6 +23,9 @@ export const OperationName = {
   columnDelete: 'columnDelete',
   columnSetAsPrimary: 'columnSetAsPrimary',
   columnsBulk: 'columnsBulk',
+  /** Inverse of a SingleLineText→link conversion: drop the link, recreate
+   *  the text column (original id) and restore its backed-up data. */
+  columnRevertLinkToText: 'columnRevertLinkToText',
 
   // Views (generic)
   viewUpdate: 'viewUpdate',

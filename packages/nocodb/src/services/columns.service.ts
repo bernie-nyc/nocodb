@@ -5905,10 +5905,10 @@ export class ColumnsService implements IColumnsService {
    * skips unmatched values, and for single-link relations takes the first
    * match. `colBody.meta.delimiter` (default ',') splits multi-value cells.
    *
-   * NOTE: undo/redo + sandbox replay of this compound conversion are not yet
-   * wired — the LTAR creation deposits its side-effect ids, but reversing the
-   * full operation (create + backfill + source drop) needs dedicated
-   * command-registry work. Tracked as a follow-up.
+   * Undo/redo: recorded under the `columnUpdate` op, which backs up the text
+   * column's data + captures the link side-effect ids. Undo dispatches
+   * `columnRevertLinkToText` ({@link revertLinkColumnToText}); redo re-runs this
+   * conversion honoring the captured ids.
    */
   async convertSingleLineTextToLtar(
     context: NcContext,
@@ -5971,6 +5971,51 @@ export class ColumnsService implements IColumnsService {
       offset += PAGE;
     }
 
+    // Snapshot the source text column (incl. id) so undo can recreate it, and
+    // back up its cell data so undo can restore the values.
+    const textColumnSnapshot: Record<string, any> = {
+      id: column.id,
+      fk_model_id: column.fk_model_id,
+      column_name: column.column_name,
+      title: column.title,
+      uidt: column.uidt,
+      dt: column.dt,
+      dtxp: column.dtxp,
+      dtxs: column.dtxs,
+      np: (column as any).np,
+      ns: (column as any).ns,
+      clen: (column as any).clen,
+      ct: (column as any).ct,
+      cdf: (column as any).cdf,
+      rqd: (column as any).rqd,
+      un: (column as any).un,
+      meta: column.meta,
+      order: column.order,
+    };
+    let dataBackup: ColumnBackupRef | undefined;
+    try {
+      dataBackup = await this.columnDataBackupHandler.backup(context, {
+        sourceColumn: column,
+        backupUid: ColumnDataBackupHandler.newBackupUid(),
+        forUndo: !!getReplay('replayBackup'),
+      });
+      captureForTrace('backup', dataBackup);
+      setReplay('columnBackupOut', dataBackup);
+    } catch (e) {
+      this.logger.warn(
+        `Text→link backup failed for ${column.id}: ${
+          (e as Error).message
+        }. Conversion will proceed without undo support.`,
+      );
+    }
+
+    // Under replay (redo / sandbox merge), reuse the originally-created link
+    // ids so later ops that reference them stay valid. The handler deposits
+    // these into the replay scope before calling this service.
+    const replayLinkColumnId = isReplay()
+      ? (getReplay('convertedLinkId') as string | undefined)
+      : undefined;
+
     // Create the LTAR column with a temporary title to avoid clashing with the
     // still-present source column. `colBody` carries the relationship config
     // (parentId/childId/type) from the field-edit modal, but it is the SOURCE
@@ -5990,6 +6035,7 @@ export class ColumnsService implements IColumnsService {
     const ltarReq = {
       ...ltarRest,
       title: tempTitle,
+      ...(replayLinkColumnId ? { id: replayLinkColumnId } : {}),
     };
     const ltarCapture: LtarSideEffectIds = {};
     const ltarColumn = await this.createLTARColumn(context, {
@@ -6003,6 +6049,10 @@ export class ColumnsService implements IColumnsService {
       _ltarCapture: ltarCapture,
     });
     captureForTrace('ltar', ltarCapture);
+    captureForTrace('convertedLink', {
+      linkColumnId: ltarColumn.id,
+      textColumn: textColumnSnapshot,
+    });
 
     // Drop the source text column and rename the LTAR to the original title
     // BEFORE backfilling. The schema steps recompute the parent model's
@@ -6013,7 +6063,10 @@ export class ColumnsService implements IColumnsService {
     // `Column.update` would re-process the LTAR relationship.
     await this.columnDelete(
       context,
-      { columnId: column.id, req, reuse: {} },
+      // Hard-delete (skipTrash): undo recreates the text column with this same
+      // id, so the meta row must be gone — its data is preserved via the
+      // backup, not trash.
+      { columnId: column.id, skipTrash: true, req, reuse: {} },
       this.metaService,
     );
 
@@ -6115,6 +6168,77 @@ export class ColumnsService implements IColumnsService {
     }
 
     return { linksCreated, valuesUnmatched };
+  }
+
+  /**
+   * Inverse of {@link convertSingleLineTextToLtar}: drop the link column
+   * (cascades its junction / back-link / FK columns and link rows), recreate
+   * the original SingleLineText column with its original id, and restore the
+   * backed-up cell data. Runs under the undo/redo replay scope, so the
+   * recreated column's pre-set id is honored.
+   */
+  async revertLinkColumnToText(
+    context: NcContext,
+    param: {
+      linkColumnId: string;
+      textColumn: Record<string, any>;
+      backupRef?: ColumnBackupRef;
+      req: NcRequest;
+    },
+  ) {
+    const { linkColumnId, textColumn, backupRef, req } = param;
+    const tableId = textColumn.fk_model_id as string;
+
+    // 1. Drop the link column — cascades junction model, FK + back-link
+    //    columns, and all link rows. Hard-delete so redo can recreate the link
+    //    (and its junction/back-links) with the same ids.
+    await this.columnDelete(
+      context,
+      { columnId: linkColumnId, skipTrash: true, req, reuse: {} },
+      this.metaService,
+    );
+
+    // 2. Recreate the text column with its original id (honored under replay).
+    const recreateReq: Record<string, any> = {
+      id: textColumn.id,
+      column_name: textColumn.column_name,
+      title: textColumn.title,
+      uidt: textColumn.uidt ?? UITypes.SingleLineText,
+      dt: textColumn.dt,
+      dtxp: textColumn.dtxp,
+      dtxs: textColumn.dtxs,
+      np: textColumn.np,
+      ns: textColumn.ns,
+      clen: textColumn.clen,
+      ct: textColumn.ct,
+      cdf: textColumn.cdf,
+      rqd: textColumn.rqd,
+      un: textColumn.un,
+      meta: textColumn.meta,
+      ...(textColumn.order != null
+        ? { column_order: { order: textColumn.order } }
+        : {}),
+    };
+    await this.columnAdd(context, {
+      tableId,
+      column: recreateReq as unknown as ColumnReqType,
+      user: req.user as UserType,
+      req,
+      reuse: {},
+    });
+
+    // 3. Restore the cell data from the backup.
+    if (backupRef) {
+      const recreated = await Column.get(context, { colId: textColumn.id });
+      if (recreated) {
+        await this.columnDataBackupHandler.restore(context, {
+          destinationColumn: recreated,
+          backupRef,
+        });
+      }
+    }
+
+    return Column.get(context, { colId: textColumn.id });
   }
 
   async createLTARColumn(

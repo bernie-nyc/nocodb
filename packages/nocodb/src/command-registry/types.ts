@@ -251,6 +251,9 @@ export interface CaptureBag {
   filters: ReadonlyArray<Record<string, unknown>>;
   /** Cell-data backup ref captured at destructive column type-changes. */
   backup: ColumnBackupRef;
+  /** Set on a SingleLineText→link conversion: the created link column id +
+   *  the replaced text column snapshot — needed to invert the conversion. */
+  convertedLink: { linkColumnId: string; textColumn: Record<string, unknown> };
   /** Every column created during a table-create (system + user + LTAR junction). */
   sandboxColumns: ReadonlyArray<{
     id?: string;
