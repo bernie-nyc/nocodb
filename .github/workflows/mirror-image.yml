@@ -1,0 +1,85 @@
+# mirror-image.yml
+#
+# This workflow pulls the pinned NocoDB release image from Docker Hub
+# and re-publishes it to GitHub Container Registry (GHCR) under the
+# bernie-nyc account. This gives us a vendor-independent copy of the
+# image at a known version that we fully control.
+#
+# Why mirror instead of building from source:
+#   NocoDB is a complex pnpm monorepo with a multi-step CI build. The
+#   upstream team has already produced a tested, production image for
+#   each release. Mirroring that image is faster and more reliable than
+#   reproducing the build here. The full source is available in this fork
+#   if a from-source build is ever needed (see UPSTREAM_SYNC.md).
+#
+# When to run:
+#   - Automatically when a commit is pushed to the stable branch
+#     (this only happens after a deliberate upstream sync, not on
+#     every push).
+#   - Manually via the "Run workflow" button in GitHub Actions.
+#
+# To update the pinned version, change PINNED_VERSION below, push the
+# change to the stable branch, and this workflow will run automatically.
+
+name: Mirror NocoDB image to GHCR
+
+on:
+  push:
+    branches:
+      - stable
+  workflow_dispatch:
+
+env:
+  # The exact upstream release tag to mirror.
+  # Update this value when syncing to a new upstream release.
+  # See UPSTREAM_SYNC.md for the full update process.
+  PINNED_VERSION: "2026.06.0"
+
+jobs:
+  mirror:
+    name: Pull from Docker Hub and push to GHCR
+    runs-on: ubuntu-latest
+
+    permissions:
+      # contents: read is needed to check out the repo (not strictly
+      # required here since we are not building from source, but
+      # GitHub Actions requires it to access the workflow file itself).
+      contents: read
+      # packages: write allows this workflow to push images to GHCR.
+      packages: write
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        # Uses the built-in GITHUB_TOKEN so no extra secrets are needed.
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull the pinned upstream image from Docker Hub
+        # Pulls the exact version we have pinned. This fails loudly if the
+        # upstream image does not exist, which is the right behavior -- we
+        # want to know immediately if the upstream disappears.
+        run: docker pull nocodb/nocodb:${{ env.PINNED_VERSION }}
+
+      - name: Tag and push both version tag and latest to GHCR
+        # We push two tags:
+        #   :2026.06.0  -- the exact version, for reproducible deployments
+        #   :latest     -- a convenience alias; always points to the most
+        #                  recently mirrored version
+        # The deployment in mnemosyne/docs/nocodb_setup.md references the
+        # version tag, not :latest, so deployments are always pinned.
+        run: |
+          docker tag nocodb/nocodb:${{ env.PINNED_VERSION }} \
+            ghcr.io/bernie-nyc/nocodb:${{ env.PINNED_VERSION }}
+          docker tag nocodb/nocodb:${{ env.PINNED_VERSION }} \
+            ghcr.io/bernie-nyc/nocodb:latest
+          docker push ghcr.io/bernie-nyc/nocodb:${{ env.PINNED_VERSION }}
+          docker push ghcr.io/bernie-nyc/nocodb:latest
+
+      - name: Print image reference
+        # Outputs the full image reference so it is easy to copy from the
+        # workflow run log.
+        run: |
+          echo "Mirrored image: ghcr.io/bernie-nyc/nocodb:${{ env.PINNED_VERSION }}"
